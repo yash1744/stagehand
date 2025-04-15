@@ -54,7 +54,7 @@ async function cleanStructuralNodes(
     cleanStructuralNodes(child, page, logger),
   );
   const resolvedChildren = await Promise.all(cleanedChildrenPromises);
-  const cleanedChildren = resolvedChildren.filter(
+  let cleanedChildren = resolvedChildren.filter(
     (child): child is AccessibilityNode => child !== null,
   );
 
@@ -136,6 +136,17 @@ async function cleanStructuralNodes(
     }
   }
 
+  // rm redundant StaticText children
+  cleanedChildren = removeRedundantStaticTextChildren(node, cleanedChildren);
+
+  if (cleanedChildren.length === 0) {
+    if (node.role === "generic" || node.role === "none") {
+      return null;
+    } else {
+      return { ...node, children: [] };
+    }
+  }
+
   // 6) Return the updated node.
   //    If it has children, update them; otherwise keep it as-is.
   return cleanedChildren.length > 0
@@ -154,6 +165,9 @@ export async function buildHierarchicalTree(
   page?: StagehandPage,
   logger?: (logLine: LogLine) => void,
 ): Promise<TreeResult> {
+  // Map to store nodeId -> URL for only those nodes that do have a URL.
+  const idToUrl: Record<string, string> = {};
+
   // Map to store processed nodes for quick lookup
   const nodeMap = new Map<string, AccessibilityNode>();
   const iframe_list: AccessibilityNode[] = [];
@@ -165,6 +179,11 @@ export async function buildHierarchicalTree(
     const nodeIdValue = parseInt(node.nodeId, 10);
     if (nodeIdValue < 0) {
       return;
+    }
+
+    const url = extractUrlFromAXNode(node);
+    if (url) {
+      idToUrl[node.nodeId] = url;
     }
 
     const hasChildren = node.childIds && node.childIds.length > 0;
@@ -239,6 +258,7 @@ export async function buildHierarchicalTree(
     tree: finalTree,
     simplified: simplifiedFormat,
     iframes: iframe_list,
+    idToUrl: idToUrl,
   };
 }
 
@@ -283,6 +303,7 @@ export async function getAccessibilityTree(
           backendDOMNodeId: node.backendDOMNodeId,
           parentId: node.parentId,
           childIds: node.childIds,
+          properties: node.properties,
         };
       }),
       page,
@@ -446,6 +467,49 @@ export async function findScrollableElementIds(
   }
 
   return scrollableBackendIds;
+}
+
+/**
+ * Removes any StaticText children whose combined text equals the parent's name.
+ * This is most often used to avoid duplicating a link's accessible name in separate child nodes.
+ *
+ * @param parent     The parent accessibility node whose `.name` we check.
+ * @param children   The parent's current children list, typically after cleaning.
+ * @returns          A filtered list of children with redundant StaticText nodes removed.
+ */
+function removeRedundantStaticTextChildren(
+  parent: AccessibilityNode,
+  children: AccessibilityNode[],
+): AccessibilityNode[] {
+  if (!parent.name) {
+    return children;
+  }
+
+  const parentName = parent.name.replace(/\s+/g, " ").trim();
+
+  // Gather all StaticText children and combine their text
+  const staticTextChildren = children.filter(
+    (child) => child.role === "StaticText" && child.name,
+  );
+  const combinedChildText = staticTextChildren
+    .map((child) => child.name!.replace(/\s+/g, " ").trim())
+    .join("");
+
+  // If the combined text exactly matches the parent's name, remove those child nodes
+  if (combinedChildText === parentName) {
+    return children.filter((child) => child.role !== "StaticText");
+  }
+
+  return children;
+}
+
+function extractUrlFromAXNode(axNode: AccessibilityNode): string | undefined {
+  if (!axNode.properties) return undefined;
+  const urlProp = axNode.properties.find((prop) => prop.name === "url");
+  if (urlProp && urlProp.value && typeof urlProp.value.value === "string") {
+    return urlProp.value.value.trim();
+  }
+  return undefined;
 }
 
 export async function performPlaywrightMethod(

@@ -1,6 +1,5 @@
 import { Browserbase } from "@browserbasehq/sdk";
 import { chromium } from "@playwright/test";
-import { randomUUID } from "crypto";
 import dotenv from "dotenv";
 import fs from "fs";
 import os from "os";
@@ -32,7 +31,7 @@ import { StagehandAPI } from "./api";
 import { scriptContent } from "./dom/build/scriptContent";
 import { LLMClient } from "./llm/LLMClient";
 import { LLMProvider } from "./llm/LLMProvider";
-import { logLineToString, isRunningInBun } from "./utils";
+import { isRunningInBun } from "./utils";
 import { ApiResponse, ErrorResponse } from "@/types/api";
 import { AgentExecuteOptions, AgentResult } from "../types/agent";
 import { StagehandAgentHandler } from "./handlers/agentHandler";
@@ -79,27 +78,16 @@ async function getBrowser(
 ): Promise<BrowserResult> {
   if (env === "BROWSERBASE") {
     if (!apiKey) {
-      logger({
-        category: "init",
-        message:
-          "BROWSERBASE_API_KEY is required to use BROWSERBASE env. Defaulting to LOCAL.",
-        level: 0,
-      });
-      env = "LOCAL";
+      throw new MissingEnvironmentVariableError(
+        "BROWSERBASE_API_KEY",
+        "Browserbase",
+      );
     }
     if (!projectId) {
-      logger({
-        category: "init",
-        message:
-          "BROWSERBASE_PROJECT_ID is required for some Browserbase features that may not work without it.",
-        level: 1,
-      });
-    }
-  }
-
-  if (env === "BROWSERBASE") {
-    if (!apiKey) {
-      throw new StagehandError("BROWSERBASE_API_KEY is required.");
+      throw new MissingEnvironmentVariableError(
+        "BROWSERBASE_PROJECT_ID",
+        "Browserbase",
+      );
     }
 
     let debugUrl: string | undefined = undefined;
@@ -114,17 +102,16 @@ async function getBrowser(
     if (browserbaseSessionID) {
       // Validate the session status
       try {
-        const sessionStatus =
+        const session =
           await browserbase.sessions.retrieve(browserbaseSessionID);
 
-        if (sessionStatus.status !== "RUNNING") {
+        if (session.status !== "RUNNING") {
           throw new StagehandError(
-            `Session ${browserbaseSessionID} is not running (status: ${sessionStatus.status})`,
+            `Session ${browserbaseSessionID} is not running (status: ${session.status})`,
           );
         }
 
         sessionId = browserbaseSessionID;
-        const session = await browserbase.sessions.retrieve(sessionId);
         connectUrl = session.connectUrl;
 
         logger({
@@ -193,8 +180,21 @@ async function getBrowser(
         },
       });
     }
-
+    if (!connectUrl.includes("connect.connect")) {
+      logger({
+        category: "init",
+        message: "connecting to browserbase session",
+        level: 1,
+        auxiliary: {
+          connectUrl: {
+            value: connectUrl,
+            type: "string",
+          },
+        },
+      });
+    }
     const browser = await chromium.connectOverCDP(connectUrl);
+
     const { debuggerUrl } = await browserbase.sessions.debug(sessionId);
 
     debugUrl = debuggerUrl;
@@ -236,31 +236,20 @@ async function getBrowser(
       },
     });
 
-    if (localBrowserLaunchOptions) {
-      logger({
-        category: "init",
-        message: "local browser launch options",
-        auxiliary: {
-          localLaunchOptions: {
-            value: JSON.stringify(localBrowserLaunchOptions),
-            type: "string",
-          },
-        },
-      });
-    }
-
     if (localBrowserLaunchOptions?.cdpUrl) {
-      logger({
-        category: "init",
-        message: "connecting to local browser via CDP URL",
-        level: 0,
-        auxiliary: {
-          cdpUrl: {
-            value: localBrowserLaunchOptions.cdpUrl,
-            type: "string",
+      if (!localBrowserLaunchOptions.cdpUrl.includes("connect.connect")) {
+        logger({
+          category: "init",
+          message: "connecting to local browser via CDP URL",
+          level: 1,
+          auxiliary: {
+            cdpUrl: {
+              value: localBrowserLaunchOptions.cdpUrl,
+              type: "string",
+            },
           },
-        },
-      });
+        });
+      }
 
       const browser = await chromium.connectOverCDP(
         localBrowserLaunchOptions.cdpUrl,
@@ -390,8 +379,6 @@ async function applyStealthScripts(context: BrowserContext) {
 export class Stagehand {
   private stagehandPage!: StagehandPage;
   private stagehandContext!: StagehandContext;
-  private intEnv: "LOCAL" | "BROWSERBASE";
-
   public browserbaseSessionID?: string;
   public readonly domSettleTimeoutMs: number;
   public readonly debugDom: boolean;
@@ -399,7 +386,6 @@ export class Stagehand {
   public verbose: 0 | 1 | 2;
   public llmProvider: LLMProvider;
   public enableCaching: boolean;
-
   private apiKey: string | undefined;
   private projectId: string | undefined;
   private externalLogger?: (logLine: LogLine) => void;
@@ -419,6 +405,7 @@ export class Stagehand {
   public readonly logInferenceToFile?: boolean;
   private stagehandLogger: StagehandLogger;
   private disablePino: boolean;
+  private _env: "LOCAL" | "BROWSERBASE";
 
   protected setActivePage(page: StagehandPage): void {
     this.stagehandPage = page;
@@ -534,9 +521,26 @@ export class Stagehand {
     this.llmProvider =
       llmProvider || new LLMProvider(this.logger, this.enableCaching);
 
-    this.intEnv = env;
     this.apiKey = apiKey ?? process.env.BROWSERBASE_API_KEY;
     this.projectId = projectId ?? process.env.BROWSERBASE_PROJECT_ID;
+
+    // Store the environment value
+    this._env = env ?? "BROWSERBASE";
+
+    if (this._env === "BROWSERBASE") {
+      if (!this.apiKey) {
+        throw new MissingEnvironmentVariableError(
+          "BROWSERBASE_API_KEY",
+          "Browserbase",
+        );
+      } else if (!this.projectId) {
+        throw new MissingEnvironmentVariableError(
+          "BROWSERBASE_PROJECT_ID",
+          "Browserbase",
+        );
+      }
+    }
+
     this.verbose = verbose ?? 0;
     // Update logger verbosity level
     this.stagehandLogger.setVerbosity(this.verbose);
@@ -573,9 +577,13 @@ export class Stagehand {
       this.usingAPI &&
       this.llmClient &&
       this.llmClient.type !== "openai" &&
-      this.llmClient.type !== "anthropic"
+      this.llmClient.type !== "anthropic" &&
+      this.llmClient.type !== "google"
     ) {
-      throw new UnsupportedModelError(["openai", "anthropic"], "API mode");
+      throw new UnsupportedModelError(
+        ["openai", "anthropic", "google"],
+        "API mode",
+      );
     }
     this.waitForCaptchaSolves = waitForCaptchaSolves;
     this.localBrowserLaunchOptions = localBrowserLaunchOptions;
@@ -619,10 +627,22 @@ export class Stagehand {
   }
 
   public get env(): "LOCAL" | "BROWSERBASE" {
-    if (this.intEnv === "BROWSERBASE" && this.apiKey && this.projectId) {
+    if (this._env === "BROWSERBASE") {
+      if (!this.apiKey) {
+        throw new MissingEnvironmentVariableError(
+          "BROWSERBASE_API_KEY",
+          "Browserbase",
+        );
+      } else if (!this.projectId) {
+        throw new MissingEnvironmentVariableError(
+          "BROWSERBASE_PROJECT_ID",
+          "Browserbase",
+        );
+      }
       return "BROWSERBASE";
+    } else {
+      return "LOCAL";
     }
-    return "LOCAL";
   }
 
   public get context(): EnhancedContext {
@@ -647,13 +667,20 @@ export class Stagehand {
         projectId: this.projectId,
         logger: this.logger,
       });
+      const modelApiKey =
+        LLMProvider.getModelProvider(this.modelName) === "openai"
+          ? process.env.OPENAI_API_KEY || this.llmClient.clientOptions.apiKey
+          : LLMProvider.getModelProvider(this.modelName) === "anthropic"
+            ? process.env.ANTHROPIC_API_KEY ||
+              this.llmClient.clientOptions.apiKey
+            : LLMProvider.getModelProvider(this.modelName) === "google"
+              ? process.env.GOOGLE_API_KEY ||
+                this.llmClient.clientOptions.apiKey
+              : undefined;
 
       const { sessionId } = await this.apiClient.init({
         modelName: this.modelName,
-        modelApiKey:
-          LLMProvider.getModelProvider(this.modelName) === "openai"
-            ? process.env.OPENAI_API_KEY
-            : process.env.ANTHROPIC_API_KEY,
+        modelApiKey: modelApiKey,
         domSettleTimeoutMs: this.domSettleTimeoutMs,
         verbose: this.verbose,
         debugDom: this.debugDom,
@@ -667,7 +694,7 @@ export class Stagehand {
       this.browserbaseSessionID = sessionId;
     }
 
-    const { context, debugUrl, sessionUrl, contextPath, sessionId, env } =
+    const { context, debugUrl, sessionUrl, contextPath, sessionId } =
       await getBrowser(
         this.apiKey,
         this.projectId,
@@ -688,7 +715,6 @@ export class Stagehand {
         };
         return br;
       });
-    this.intEnv = env;
     this.contextPath = contextPath;
 
     this.stagehandContext = await StagehandContext.init(context, this);
@@ -709,63 +735,11 @@ export class Stagehand {
     return { debugUrl, sessionUrl, sessionId };
   }
 
-  private pending_logs_to_send_to_browserbase: LogLine[] = [];
-
-  private is_processing_browserbase_logs: boolean = false;
-
   log(logObj: LogLine): void {
     logObj.level = logObj.level ?? 1;
 
     // Use our Pino-based logger
     this.stagehandLogger.log(logObj);
-
-    this.pending_logs_to_send_to_browserbase.push({
-      ...logObj,
-      id: randomUUID(),
-    });
-    this._run_browserbase_log_processing_cycle();
-  }
-
-  private async _run_browserbase_log_processing_cycle() {
-    if (this.is_processing_browserbase_logs) {
-      return;
-    }
-    this.is_processing_browserbase_logs = true;
-    const pending_logs = [...this.pending_logs_to_send_to_browserbase];
-    for (const logObj of pending_logs) {
-      await this._log_to_browserbase(logObj);
-    }
-    this.is_processing_browserbase_logs = false;
-  }
-
-  private async _log_to_browserbase(logObj: LogLine) {
-    logObj.level = logObj.level ?? 1;
-
-    if (!this.stagehandPage) {
-      return;
-    }
-
-    if (this.verbose >= logObj.level) {
-      await this.page
-        .evaluate((logObj) => {
-          const logMessage = logLineToString(logObj);
-          if (
-            logObj.message.toLowerCase().includes("trace") ||
-            logObj.message.toLowerCase().includes("error:")
-          ) {
-            console.error(logMessage);
-          } else {
-            console.log(logMessage);
-          }
-        }, logObj)
-        .then(() => {
-          this.pending_logs_to_send_to_browserbase =
-            this.pending_logs_to_send_to_browserbase.filter(
-              (log) => log.id !== logObj.id,
-            );
-        })
-        .catch(() => {});
-    }
   }
 
   /** @deprecated Use stagehand.page.act() instead. This will be removed in the next major release. */
@@ -884,6 +858,8 @@ export class Stagehand {
             options.options.apiKey = process.env.ANTHROPIC_API_KEY;
           } else if (options.provider === "openai") {
             options.options.apiKey = process.env.OPENAI_API_KEY;
+          } else if (options.provider === "google") {
+            options.options.apiKey = process.env.GOOGLE_API_KEY;
           }
 
           if (!options.options.apiKey) {
